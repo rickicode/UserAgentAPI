@@ -154,7 +154,7 @@ app.post('/validate-api-key', async (req, res) => {
     
     try {
         // Test API key with a simple request and timeout
-        const testUrl = `${API_BASE_URL}?chrome=chrome`;
+        const testUrl = `${API_BASE_URL}?chrome=true`;
         const response = await axios.get(testUrl, {
             headers: {
                 'apikey': trimmedKey
@@ -244,10 +244,10 @@ async function scrapUserAgentsConcurrent(maxCount, selectedDevices, apiKey, clie
     let errorCount = 0;
     let processedCount = 0;
 
-    // Build query parameters
+    // Build query parameters with true/false values
     const params = new URLSearchParams();
     selectedDevices.forEach(device => {
-        params.append(device, device);
+        params.append(device, 'true');
     });
 
     const apiUrl = `${API_BASE_URL}?${params.toString()}`;
