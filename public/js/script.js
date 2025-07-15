@@ -5,6 +5,7 @@ class UserAgentScraper {
         this.isValidatingKey = false;
         this.isKeyValid = false;
         this.userAgents = [];
+        this.clientId = null;
         
         this.initializeElements();
         this.bindEvents();
@@ -81,6 +82,22 @@ class UserAgentScraper {
         const savedApiKey = localStorage.getItem('userAgentScraperApiKey');
         if (savedApiKey) {
             this.apiKeyInput.value = savedApiKey;
+            // Check if we have a cached validation result
+            const lastValidation = localStorage.getItem('userAgentScraperLastValidation');
+            if (lastValidation) {
+                try {
+                    const validation = JSON.parse(lastValidation);
+                    const now = Date.now();
+                    // If validation was successful and less than 5 minutes ago
+                    if (validation.valid && validation.apiKey === savedApiKey &&
+                        (now - validation.timestamp) < 5 * 60 * 1000) {
+                        this.isKeyValid = true;
+                        this.showValidationStatus('success', '✅ API key is valid! (cached)');
+                    }
+                } catch (error) {
+                    console.error('Error parsing validation cache:', error);
+                }
+            }
         }
         
         // Load saved maximum user agents count from localStorage
@@ -120,7 +137,7 @@ class UserAgentScraper {
         e.preventDefault();
         
         if (this.isScrapingActive) {
-            this.stopScraping();
+            await this.stopScraping();
             return;
         }
         
@@ -158,6 +175,10 @@ class UserAgentScraper {
         this.validationStatus.className = 'validation-status empty';
         this.validationStatus.textContent = '';
         this.saveApiKey();
+        
+        // Clear cached validation when API key changes
+        localStorage.removeItem('userAgentScraperLastValidation');
+        
         this.validateForm();
     }
     
@@ -193,32 +214,68 @@ class UserAgentScraper {
             return;
         }
         
+        // Basic client-side validation for API key format
+        if (apiKey.length < 10) {
+            this.showValidationStatus('error', 'API key appears to be too short');
+            return;
+        }
+        
+        // Check if key looks like a valid format (basic heuristic)
+        if (!/^[a-zA-Z0-9_-]+$/.test(apiKey)) {
+            this.showValidationStatus('error', 'API key contains invalid characters');
+            return;
+        }
+        
         this.isValidatingKey = true;
         this.updateValidateButton(true);
         
         try {
+            const controller = new AbortController();
+            const timeoutId = setTimeout(() => controller.abort(), 8000); // 8 second timeout
+            
             const response = await fetch('/validate-api-key', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify({ apiKey })
+                body: JSON.stringify({ apiKey }),
+                signal: controller.signal
             });
             
+            clearTimeout(timeoutId);
             const data = await response.json();
             
             if (response.ok) {
                 this.isKeyValid = true;
-                this.showValidationStatus('success', data.message);
+                const message = data.cached ?
+                    `✅ API key is valid! (cached)` :
+                    `✅ API key is valid and working!`;
+                this.showValidationStatus('success', message);
                 this.saveApiKey(); // Save valid API key
+                
+                // Cache the validation result
+                localStorage.setItem('userAgentScraperLastValidation', JSON.stringify({
+                    valid: true,
+                    apiKey: apiKey,
+                    timestamp: Date.now()
+                }));
             } else {
                 this.isKeyValid = false;
                 this.showValidationStatus('error', data.message || data.error);
+                
+                // Remove cached validation on failure
+                localStorage.removeItem('userAgentScraperLastValidation');
             }
             
         } catch (error) {
             this.isKeyValid = false;
-            this.showValidationStatus('error', 'Failed to validate API key. Please try again.');
+            
+            if (error.name === 'AbortError') {
+                this.showValidationStatus('error', 'Validation timed out. Please try again.');
+            } else {
+                this.showValidationStatus('error', 'Failed to validate API key. Please check your connection.');
+            }
+            
             console.error('API key validation error:', error);
         } finally {
             this.isValidatingKey = false;
@@ -284,16 +341,29 @@ class UserAgentScraper {
             this.showProgress();
             this.userAgents = [];
             
-            // Initialize Server-Sent Events
+            // Initialize Server-Sent Events first to get clientId
             this.initializeEventSource();
             
-            // Start scraping
+            // Wait for client ID to be received
+            await new Promise(resolve => {
+                const checkClientId = () => {
+                    if (this.clientId) {
+                        resolve();
+                    } else {
+                        setTimeout(checkClientId, 100);
+                    }
+                };
+                checkClientId();
+            });
+            
+            // Start scraping with clientId
+            const scrapingData = { ...formData, clientId: this.clientId };
             const response = await fetch('/scrape', {
                 method: 'POST',
                 headers: {
                     'Content-Type': 'application/json',
                 },
-                body: JSON.stringify(formData)
+                body: JSON.stringify(scrapingData)
             });
             
             if (!response.ok) {
@@ -339,6 +409,10 @@ class UserAgentScraper {
         switch (data.type) {
             case 'connected':
                 console.log('Connected to server stream');
+                if (data.clientId) {
+                    this.clientId = data.clientId;
+                    console.log('Client ID received:', this.clientId);
+                }
                 break;
                 
             case 'userAgent':
@@ -399,7 +473,26 @@ class UserAgentScraper {
         this.totalCount.textContent = total;
     }
     
-    stopScraping() {
+    async stopScraping() {
+        if (this.isScrapingActive && this.clientId) {
+            try {
+                // Send stop request to server
+                const response = await fetch('/stop-scraping', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({ clientId: this.clientId })
+                });
+                
+                if (!response.ok) {
+                    console.error('Failed to stop scraping on server');
+                }
+            } catch (error) {
+                console.error('Error stopping scraping:', error);
+            }
+        }
+        
         this.isScrapingActive = false;
         this.updateScrapingUI(false);
         this.hideProgress();
@@ -414,15 +507,19 @@ class UserAgentScraper {
     }
     
     updateScrapingUI(isActive) {
-        this.scrapeBtn.disabled = isActive;
+        this.scrapeBtn.disabled = false; // Always enable button to allow stop
         this.btnText.style.display = isActive ? 'none' : 'inline';
         this.btnLoader.style.display = isActive ? 'inline' : 'none';
         
-        // Update button text
+        // Update button text and functionality
         if (isActive) {
-            this.scrapeBtn.innerHTML = '<span class="btn-loader">🔄 Scraping...</span>';
+            this.scrapeBtn.innerHTML = '<span class="btn-loader">🛑 Stop Scraping</span>';
+            this.scrapeBtn.style.backgroundColor = '#dc3545';
+            this.scrapeBtn.style.borderColor = '#dc3545';
         } else {
             this.scrapeBtn.innerHTML = '<span class="btn-text">Start Scraping</span>';
+            this.scrapeBtn.style.backgroundColor = '';
+            this.scrapeBtn.style.borderColor = '';
         }
         
         // Disable form controls during scraping
